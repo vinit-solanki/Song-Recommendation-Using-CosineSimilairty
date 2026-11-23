@@ -113,46 +113,90 @@ class EnhancedMusicRecommendationModel:
     # ============================
     # RECOMMENDATION
     # ============================
-    def recommend_by_emotion(self, emotion, n=10):
-        emotion = emotion.lower().strip()
+    # Numeric filters accepted by /api/recommend -> dataset column.
+    # Energy and Danceability are stored on a 0-100 scale, Tempo in BPM.
+    RANGE_FILTERS = {
+        "tempo": "Tempo",
+        "energy": "Energy",
+        "danceability": "Danceability",
+    }
+    MAX_PER_ARTIST = 2
 
-        if emotion not in self.df["emotion"].unique():
+    @staticmethod
+    def _number(value):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if np.isfinite(number) else None
+
+    def _apply_filters(self, candidates, filters):
+        for key, column in self.RANGE_FILTERS.items():
+            low = self._number(filters.get(f"{key}_min"))
+            high = self._number(filters.get(f"{key}_max"))
+            if low is not None:
+                candidates = candidates[candidates[column] >= low]
+            if high is not None:
+                candidates = candidates[candidates[column] <= high]
+        if filters.get("explicit") is True:
+            candidates = candidates[candidates["Explicit"] == 1]
+        return candidates
+
+    def recommend_by_emotion(self, emotion, n=10, filters=None):
+        """
+        Pick a random seed song with the requested emotion (and filters), then
+        rank every other matching song by cosine similarity to the seed in PCA
+        space, blended with popularity. At most MAX_PER_ARTIST songs per artist
+        keeps the mix varied, and the random seed gives a fresh mix each call.
+        """
+        emotion = str(emotion or "").lower().strip()
+        filters = filters if isinstance(filters, dict) else {}
+
+        if emotion not in set(self.df["emotion"].unique()):
             return {"error": f"Emotion '{emotion}' not found"}
 
-        ref_songs = self.df[self.df["emotion"] == emotion]
-        ref_idx = ref_songs.sample(1).index[0]
-        idx = self.df.index.get_loc(ref_idx)
+        candidates = self._apply_filters(self.df[self.df["emotion"] == emotion], filters)
+        candidates = candidates.drop_duplicates(subset=["artist", "song"])
 
-        distances, indices = self.nn.kneighbors(
-            [self.features_scaled[idx]],
-            n_neighbors=min(n + 1, len(self.df))
-        )
+        base = {
+            "emotion": emotion,
+            "pca_variance_explained": round(float(self.pca.explained_variance_ratio_.sum()), 3),
+            "algorithm": "pca_cosine_popularity_blend",
+        }
+        if candidates.empty:
+            return {**base, "count": 0, "recommendations": []}
 
-        results = []
-        for i in indices[0][1:]:
-            song = self.df.iloc[i]
-            if song["emotion"] != emotion:
+        positions = self.df.index.get_indexer(candidates.index)
+        vectors = self.features_scaled[positions]
+        seed = vectors[np.random.randint(len(vectors))]
+
+        norms = np.linalg.norm(vectors, axis=1) * np.linalg.norm(seed)
+        similarity = np.divide(vectors @ seed, norms, out=np.zeros(len(vectors)), where=norms > 0)
+        popularity = candidates["Popularity"].to_numpy(dtype=float) / 100.0
+        score = 0.85 * similarity + 0.15 * popularity
+
+        results, per_artist = [], {}
+        for i in np.argsort(-score):
+            row = candidates.iloc[i]
+            artist_key = str(row["artist"]).lower()
+            if per_artist.get(artist_key, 0) >= self.MAX_PER_ARTIST:
                 continue
+            per_artist[artist_key] = per_artist.get(artist_key, 0) + 1
             results.append({
-                "artist": song["artist"],
-                "song": song["song"],
-                "emotion": song["emotion"],
-                "genre": song["Genre"],
-                "popularity": int(song["Popularity"]),
-                "energy": int(song["Energy"]),
-                "danceability": int(song["Danceability"],
-                )
+                "artist": str(row["artist"]),
+                "song": str(row["song"]),
+                "emotion": str(row["emotion"]),
+                "genre": str(row["Genre"]),
+                "popularity": int(row["Popularity"]),
+                "energy": int(row["Energy"]),
+                "danceability": int(row["Danceability"]),
+                "tempo": int(row["Tempo"]),
+                "similarity_score": round(float(max(similarity[i], 0.0)), 3),
             })
-
             if len(results) >= n:
                 break
 
-        return {
-            "emotion": emotion,
-            "count": len(results),
-            "recommendations": results,
-            "pca_variance_explained": round(float(self.pca.explained_variance_ratio_.sum()), 3)
-        }
+        return {**base, "count": len(results), "recommendations": results}
 
     # ============================
     # INFO
@@ -197,14 +241,21 @@ def health():
 
 @app.route("/api/recommend", methods=["POST"])
 def recommend():
-    data = request.get_json()
+    if model is None or model.df is None:
+        return jsonify({"error": "Model not initialized"}), 503
+
+    data = request.get_json(silent=True) or {}
     emotion = data.get("emotion")
-    n = min(int(data.get("num_recommendations", 10)), 20)
+    try:
+        n = max(1, min(int(data.get("num_recommendations", 10)), 20))
+    except (TypeError, ValueError):
+        n = 10
 
     if not emotion:
         return jsonify({"error": "emotion required"}), 400
 
-    return jsonify(model.recommend_by_emotion(emotion, n))
+    result = model.recommend_by_emotion(emotion, n, data.get("filters"))
+    return jsonify(result), (404 if "error" in result else 200)
 
 @app.route("/api/model-info")
 def info():
@@ -348,4 +399,10 @@ def api_debug():
 
 if __name__ == "__main__":
     init()
-    app.run(host="0.0.0.0", port=5005, debug=True)
+    # Render assigns PORT. Debug mode stays off in production: it exposes the
+    # Werkzeug debugger and its reloader would load the model twice.
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5005)),
+        debug=os.environ.get("FLASK_DEBUG") == "1",
+    )
